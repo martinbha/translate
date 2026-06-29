@@ -28,36 +28,34 @@ def _whisper_translate_model():
 
 @lru_cache(maxsize=1)
 def _diarize_pipeline():
-    # DiarizationPipeline moved to whisperx.diarize in recent releases;
-    # fall back to the older top-level location.
-    try:
-        from whisperx.diarize import DiarizationPipeline
-    except ImportError:  # pragma: no cover - version dependent
-        from whisperx import DiarizationPipeline  # type: ignore
-
+    # Call pyannote directly (not via whisperx's wrapper) so we can request
+    # per-speaker embeddings — the voiceprints used for identification.
     import inspect
-
-    # The HF auth kwarg was renamed use_auth_token -> token across whisperx /
-    # pyannote versions; pick whichever this build actually accepts.
-    params = inspect.signature(DiarizationPipeline.__init__).parameters
-    kwargs = {"device": settings.whisper_device}
-    token = settings.hf_token or None
-    if "use_auth_token" in params:
-        kwargs["use_auth_token"] = token
-    elif "token" in params:
-        kwargs["token"] = token
-
-    # Newer whisperx defaults to the gated `speaker-diarization-community-1`.
-    # Pin to a model we have access to (override with DIARIZATION_MODEL).
     import os
+
+    import torch
+    from pyannote.audio import Pipeline
 
     model_name = os.environ.get(
         "DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1"
     )
-    if "model_name" in params:
-        kwargs["model_name"] = model_name
+    # token vs use_auth_token kwarg renamed across versions.
+    params = inspect.signature(Pipeline.from_pretrained).parameters
+    kw = {}
+    token = settings.hf_token or None
+    if "token" in params:
+        kw["token"] = token
+    elif "use_auth_token" in params:
+        kw["use_auth_token"] = token
 
-    return DiarizationPipeline(**kwargs)
+    pipeline = Pipeline.from_pretrained(model_name, **kw)
+    if pipeline is None:
+        raise RuntimeError(
+            f"Failed to load diarization pipeline '{model_name}'. "
+            "Check HF token + model access."
+        )
+    pipeline.to(torch.device(settings.whisper_device))
+    return pipeline
 
 
 def load_audio(path: str):
@@ -75,16 +73,36 @@ def translate_to_english(audio) -> dict:
     return model.transcribe(audio, batch_size=settings.whisper_batch_size)
 
 
-def diarize_spans(audio, num_speakers: int | None = None) -> list[dict]:
-    """Run pyannote on the audio. Returns [{'start', 'end', 'speaker'}, ...]."""
+def diarize(audio, num_speakers: int | None = None) -> tuple[list[dict], dict]:
+    """Diarize the audio.
+
+    Returns:
+      spans: [{'start', 'end', 'speaker'}, ...]  (speaker = raw label)
+      embeddings: {label: np.ndarray}            (centroid voiceprint per speaker)
+    """
+    import torch
+
     pipeline = _diarize_pipeline()
-    kwargs = {}
+    # pyannote wants a file path or an in-memory waveform dict. whisperx gives
+    # us a float32 mono numpy array at 16 kHz.
+    waveform = torch.from_numpy(audio).unsqueeze(0)
+    inp = {"waveform": waveform, "sample_rate": 16000}
+
+    kwargs = {"return_embeddings": True}
     if num_speakers:
         kwargs["num_speakers"] = num_speakers
-    df = pipeline(audio, **kwargs)  # pandas DataFrame: start, end, speaker
+    diarization, emb_matrix = pipeline(inp, **kwargs)
+
     spans = [
-        {"start": float(row.start), "end": float(row.end), "speaker": row.speaker}
-        for row in df.itertuples()
+        {"start": float(turn.start), "end": float(turn.end), "speaker": speaker}
+        for turn, _, speaker in diarization.itertracks(yield_label=True)
     ]
     spans.sort(key=lambda s: s["start"])
-    return spans
+
+    # emb_matrix rows align with sorted(diarization.labels()).
+    embeddings: dict = {}
+    if emb_matrix is not None:
+        for i, label in enumerate(sorted(diarization.labels())):
+            if i < len(emb_matrix):
+                embeddings[label] = emb_matrix[i]
+    return spans, embeddings

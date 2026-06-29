@@ -43,6 +43,7 @@ async def transcribe_job(ctx, job_id: str) -> None:
             audio_path=job.stored_path,
             output_path=out_path,
             original_filename=job.original_filename,
+            job_id=job_id,
             progress=progress,
         )
         mark_done(
@@ -58,8 +59,26 @@ async def transcribe_job(ctx, job_id: str) -> None:
         mark_error(job_id, f"{type(exc).__name__}: {exc}")
 
 
+async def enroll_job(ctx, person_id: int, audio_path: str) -> None:
+    """Extract a voiceprint from an uploaded sample and store it for a person."""
+    from app.people import add_voiceprint
+    from worker.pipeline import extract_voiceprint
+
+    try:
+        vp = extract_voiceprint(audio_path)
+        if vp:
+            add_voiceprint(person_id, vp, source="enroll")
+            print(f"Enrolled voiceprint for person {person_id}.")
+        else:
+            print(f"No usable voice found in enrollment sample for {person_id}.")
+    except Exception:  # noqa: BLE001
+        import traceback
+
+        traceback.print_exc()
+
+
 class WorkerSettings:
-    functions = [transcribe_job]
+    functions = [transcribe_job, enroll_job]
     on_startup = startup
     redis_settings = redis_settings()
     # One GPU -> one job at a time. No timeout cap: long files are expected.

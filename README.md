@@ -1,29 +1,43 @@
 # Transcribe & Translate
 
 Self-hosted web app: log in, drop an audio (or video) file, and get back a
-nicely formatted Markdown transcript — **diarized** (per-speaker) and
-**translated into English**.
+nicely formatted Markdown transcript — **diarized**, **speaker-identified by
+voice**, and **translated into English**.
 
-- **WhisperX** for transcription + word-level alignment
-- **pyannote** (via WhisperX) for speaker diarization
-- **NLLB-200** for local X→English translation
+- **Whisper** (large-v3, via WhisperX) in `translate` mode for direct X→English
+- **pyannote** for speaker diarization **and** voiceprint embeddings
+- **Voice identification**: enroll known people + learn from naming corrections
 - **FastAPI** + a single-GPU **arq** worker, **SQLite**, single-user login with **TOTP 2FA**
 - Lightweight **React** frontend, served on **port 8000** (your nginx subdomain proxies to it)
 
 ## Pipeline
 
 ```
-audio ─▶ WhisperX transcribe (source language)
-      ─▶ align (word timestamps)
-      ─▶ pyannote diarize (who spoke when)
-      ─▶ NLLB translate each turn → English
-      ─▶ render Markdown  (## Speaker 1 · 00:01:23)
+                ┌─ pyannote diarize ──▶ speaker spans + a voiceprint per speaker
+audio ──────────┤                          │
+                └─ Whisper translate ─▶ English segments w/ timestamps
+                                           │
+              join by timestamp overlap ───┘ + match voiceprints to known people
+                                           │
+              render Markdown  (### Martin · 00:01:23   /   ### Speaker 2 · …)
 ```
 
-Transcription/diarization run in the **source** language (so alignment stays
-accurate), then each speaker turn is translated to English. That's why we use
-NLLB rather than Whisper's built-in `translate` task, which would discard the
-speaker mapping.
+Diarization and translation are **two independent passes** over the audio,
+joined by timestamp. Whisper's `translate` task emits English directly (so
+bilingual audio is normalized to English), while pyannote handles *who spoke
+when* acoustically — and hands us a centroid **voiceprint** per speaker, which
+we cosine-match against enrolled people to put real names on the transcript.
+
+## Speaker identification
+
+- **Enroll**: upload a clean voice sample per person → a voiceprint is stored.
+- **Auto-label**: future meetings match each diarized voice to known people
+  (above `SPEAKER_MATCH_THRESHOLD`); unmatched voices stay `Speaker N`.
+- **Learn from corrections**: naming a speaker in a transcript saves *that*
+  voiceprint to the person, so identification improves with use.
+
+The transcript renders from stored segments + current names, so renaming a
+speaker updates the document instantly — no re-transcription.
 
 ## Architecture
 
@@ -134,13 +148,15 @@ python -m worker.pipeline path/to/audio.m4a out.md
 
 ## Notes & knobs
 
-- **VRAM**: `large-v3` + alignment + diarization + NLLB fit comfortably in 16 GB.
+- **VRAM**: `large-v3` (translate) + diarization fit comfortably in 16 GB.
   Lower `WHISPER_COMPUTE_TYPE` to `int8_float16` if you ever run tight.
 - **One job at a time**: the worker is `max_jobs=1` — the GPU does one anyway.
-- **Files are kept**: uploads live in `data/uploads/`, outputs in `data/outputs/`.
-  Nothing is auto-deleted.
-- **Unsupported translation pairs**: if Whisper detects a language NLLB doesn't
-  cover, the transcript is kept in the original language (still diarized).
+- **Files are kept**: uploads live in `data/uploads/`, outputs in `data/outputs/`
+  (`{job}.md` + `{job}.segments.json`). Nothing is auto-deleted.
+- **Identification threshold**: `SPEAKER_MATCH_THRESHOLD` (default 0.5). Raise it
+  if guests get mislabeled as known people; lower it if known people are missed.
+- **Translation is always → English** (Whisper `translate`). Other targets would
+  need a separate MT/LLM step.
 - **Security**: single user, argon2 password, TOTP 2FA, login lockout after 5
   failed attempts / 15 min, signed httpOnly session cookie, upload size + type
-  validation.
+  validation. Note: voiceprints are biometric data, kept only in your SQLite DB.

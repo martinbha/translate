@@ -26,7 +26,10 @@ class Settings(BaseSettings):
     whisper_compute_type: str = "float16"
     whisper_device: str = "cuda"
     whisper_batch_size: int = 16
-    nllb_model: str = "facebook/nllb-200-distilled-600M"
+
+    # Speaker identification: cosine similarity above which a diarized voice is
+    # auto-labeled with a known person. Tune per diarization model (0.4–0.6).
+    speaker_match_threshold: float = 0.5
 
     # Uploads
     max_upload_mb: int = 2048

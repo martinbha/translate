@@ -49,4 +49,30 @@ export const api = {
       xhr.send(form);
     }),
   downloadUrl: (id) => `/api/jobs/${id}/download`,
+
+  // People (known speakers)
+  people: () => req("/api/people"),
+  addPerson: (name) =>
+    req("/api/people", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    }),
+  deletePerson: (id) => req(`/api/people/${id}`, { method: "DELETE" }),
+  enroll: (id, file) => {
+    const f = new FormData();
+    f.append("file", file);
+    return req(`/api/people/${id}/enroll`, { method: "POST", body: f });
+  },
+
+  // Per-job speakers
+  speakers: (jobId) => req(`/api/jobs/${jobId}/speakers`),
+  assignSpeaker: (jobId, speakerId, body) =>
+    req(`/api/jobs/${jobId}/speakers/${speakerId}/assign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  sampleUrl: (jobId, speakerId) =>
+    `/api/jobs/${jobId}/speakers/${speakerId}/sample`,
 };

@@ -88,11 +88,126 @@ function Dashboard({ user, onLogout }) {
 
       <Uploader onUploaded={refresh} />
 
+      <People />
+
       <div className="card">
         <h1 style={{ fontSize: 17, marginBottom: 6 }}>Jobs</h1>
         {jobs.length === 0 && <div className="sub">No jobs yet. Drop an audio file above.</div>}
         {jobs.map((j) => <JobRow key={j.id} job={j} />)}
       </div>
+    </div>
+  );
+}
+
+function People() {
+  const [people, setPeople] = useState([]);
+  const [name, setName] = useState("");
+  const [open, setOpen] = useState(false);
+
+  async function refresh() {
+    try { setPeople(await api.people()); } catch {}
+  }
+  useEffect(() => { refresh(); }, []);
+
+  async function add(e) {
+    e.preventDefault();
+    if (!name.trim()) return;
+    await api.addPerson(name.trim()).catch(() => {});
+    setName("");
+    refresh();
+  }
+
+  async function enroll(id, file) {
+    if (!file) return;
+    await api.enroll(id, file).catch((e) => alert("Enroll failed: " + e.message));
+    // Voiceprint extraction runs on the worker; refresh shortly after.
+    setTimeout(refresh, 4000);
+  }
+
+  return (
+    <div className="card">
+      <div className="row" style={{ display: "flex", justifyContent: "space-between" }}>
+        <h1 style={{ fontSize: 17 }}>Known speakers</h1>
+        <button className="ghost" onClick={() => setOpen(!open)}>
+          {open ? "Hide" : `Manage (${people.length})`}
+        </button>
+      </div>
+      {open && (
+        <>
+          <div className="sub" style={{ margin: "6px 0 12px" }}>
+            Enroll a clean voice sample per person, or just name speakers on a
+            transcript below — either way their voice is learned and auto-labeled next time.
+          </div>
+          {people.map((p) => (
+            <div className="job" key={p.id}>
+              <div className="row" style={{ display: "flex", justifyContent: "space-between" }}>
+                <div className="fname">{p.name}</div>
+                <div className="actions">
+                  <span className="sub">{p.voiceprints} voiceprint{p.voiceprints === 1 ? "" : "s"}</span>
+                  <label className="ghost" style={{ padding: "6px 10px", borderRadius: 8, cursor: "pointer", border: "1px solid var(--border)" }}>
+                    Enroll sample
+                    <input type="file" accept="audio/*,video/*" style={{ display: "none" }}
+                      onChange={(e) => enroll(p.id, e.target.files?.[0])} />
+                  </label>
+                  <button className="ghost" onClick={async () => { await api.deletePerson(p.id).catch(()=>{}); refresh(); }}>Delete</button>
+                </div>
+              </div>
+            </div>
+          ))}
+          <form onSubmit={add} style={{ display: "flex", gap: 8, marginTop: 12 }}>
+            <input placeholder="Add a person (name)" value={name} onChange={(e) => setName(e.target.value)} />
+            <button>Add</button>
+          </form>
+        </>
+      )}
+    </div>
+  );
+}
+
+function Speakers({ jobId, onRenamed }) {
+  const [speakers, setSpeakers] = useState([]);
+  const [people, setPeople] = useState([]);
+
+  async function refresh() {
+    try {
+      const [s, p] = await Promise.all([api.speakers(jobId), api.people()]);
+      setSpeakers(s);
+      setPeople(p);
+    } catch {}
+  }
+  useEffect(() => { refresh(); }, [jobId]);
+
+  async function assign(sid, value) {
+    if (!value) return;
+    let body;
+    if (value === "new:") {
+      const name = prompt("New person's name:");
+      if (!name || !name.trim()) return;
+      body = { new_name: name.trim() };
+    } else {
+      body = { person_id: Number(value) };
+    }
+    await api.assignSpeaker(jobId, sid, body).catch((e) => alert(e.message));
+    await refresh();
+    onRenamed && onRenamed();
+  }
+
+  if (!speakers.length) return null;
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div className="sub" style={{ marginBottom: 6 }}>Speakers — listen and assign names:</div>
+      {speakers.map((s) => (
+        <div key={s.id} className="row" style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+          <span style={{ minWidth: 90, fontWeight: 600 }}>{s.display_name}</span>
+          {s.auto_matched && <span className="pill done">auto {Math.round((s.match_score || 0) * 100)}%</span>}
+          <audio controls preload="none" src={api.sampleUrl(jobId, s.id)} style={{ height: 30, maxWidth: 200 }} />
+          <select defaultValue="" onChange={(e) => assign(s.id, e.target.value)}>
+            <option value="" disabled>Assign…</option>
+            {people.map((p) => <option key={p.id} value={String(p.id)}>{p.name}</option>)}
+            <option value="new:">+ New person…</option>
+          </select>
+        </div>
+      ))}
     </div>
   );
 }
@@ -158,14 +273,18 @@ function JobRow({ job }) {
   const [preview, setPreview] = useState(null);
   const pct = Math.round((job.progress || 0) * 100);
 
-  async function togglePreview() {
-    if (preview) return setPreview(null);
+  async function loadPreview() {
     try {
       const r = await api.markdown(job.id);
       setPreview(r.markdown);
     } catch (e) {
       setPreview("Could not load preview: " + e.message);
     }
+  }
+
+  async function togglePreview() {
+    if (preview) return setPreview(null);
+    loadPreview();
   }
 
   return (
@@ -198,6 +317,7 @@ function JobRow({ job }) {
               {preview ? "Hide" : "Preview"}
             </button>
           </div>
+          <Speakers jobId={job.id} onRenamed={() => preview && loadPreview()} />
           {preview && <pre className="preview">{preview}</pre>}
         </>
       )}

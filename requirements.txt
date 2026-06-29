@@ -12,3 +12,4 @@ argon2-cffi>=23.1
 pyotp>=2.9
 itsdangerous>=2.1
 qrcode>=7.4
+numpy>=1.24
