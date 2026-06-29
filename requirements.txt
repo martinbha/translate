@@ -1,0 +1,14 @@
+# Web / API / queue layer. Installs anywhere (no GPU needed).
+# For the model/GPU stack see requirements-gpu.txt.
+
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+sqlmodel>=0.0.16
+pydantic-settings>=2.2
+arq>=0.25
+redis>=5.0
+argon2-cffi>=23.1
+pyotp>=2.9
+itsdangerous>=2.1
+qrcode>=7.4

@@ -1,0 +1,18 @@
+# GPU / model stack. Install ONLY on the server with the RTX 5080.
+#
+# The 5080 is Blackwell (compute capability sm_120). It needs a CUDA 12.8+
+# PyTorch build; the default PyPI wheels will NOT have Blackwell kernels.
+#
+# Install PyTorch FIRST, from the CUDA 12.8 index, then the rest:
+#
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements-gpu.txt
+#
+# faster-whisper pulls ctranslate2; ensure ctranslate2 >= 4.5 for Blackwell.
+# If diarization fails to load cuDNN, install nvidia-cudnn-cu12 in the venv.
+
+whisperx>=3.1.5
+ctranslate2>=4.5.0
+transformers>=4.40
+pyannote.audio>=3.1
+# torch / torchaudio are installed separately from the cu128 index (see above).

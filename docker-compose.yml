@@ -1,0 +1,45 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - ./data/redis:/data
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATA_DIR=/srv/data
+    ports:
+      - "8000:8000"          # your nginx subdomain proxies here
+    volumes:
+      - ./data:/srv/data
+      - hf-cache:/root/.cache/huggingface
+    depends_on:
+      - redis
+
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATA_DIR=/srv/data
+    command: arq worker.settings.WorkerSettings
+    volumes:
+      - ./data:/srv/data
+      - hf-cache:/root/.cache/huggingface
+    depends_on:
+      - redis
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:
