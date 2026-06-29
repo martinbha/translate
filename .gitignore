@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Env / secrets
+.env
+
+# Runtime data (uploads, outputs, sqlite db)
+data/
+*.db
+*.sqlite3
+
+# Model caches
+.cache/
+models/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# OS
+.DS_Store
