@@ -16,6 +16,11 @@ services:
       - "8000:8000"          # your nginx subdomain proxies here
     volumes:
       - ./data:/srv/data
+      # Mount source over the image copy: `git pull` + `docker compose restart`
+      # picks up Python/frontend changes with NO rebuild.
+      - ./app:/srv/app
+      - ./worker:/srv/worker
+      - ./frontend/dist:/srv/frontend/dist
       - hf-cache:/root/.cache/huggingface
     depends_on:
       - redis
@@ -30,6 +35,8 @@ services:
     command: arq worker.settings.WorkerSettings
     volumes:
       - ./data:/srv/data
+      - ./app:/srv/app
+      - ./worker:/srv/worker
       - hf-cache:/root/.cache/huggingface
     depends_on:
       - redis

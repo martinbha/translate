@@ -1,0 +1,21 @@
+# Keep the build context tiny — Docker tars this up and sends it to the daemon
+# on every build. Without excluding data/ the context balloons as uploads land.
+.git
+data/
+*.db
+*.sqlite3
+
+# Frontend: only the built dist/ is COPYed into the image; node_modules is huge.
+frontend/node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Model caches (mounted as a volume at runtime, never baked in)
+.cache/
+models/
+
+.DS_Store
