@@ -21,8 +21,8 @@ async def startup(ctx) -> None:
     try:
         from worker import asr
 
-        asr._whisper_model()
-        print("Whisper model warm.")
+        asr._whisper_translate_model()
+        print("Whisper translate model warm.")
     except Exception as exc:  # noqa: BLE001 - warmup is best-effort
         print(f"Model warmup skipped: {exc}")
 

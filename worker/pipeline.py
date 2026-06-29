@@ -7,8 +7,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from app.config import settings
-from worker import asr, translate
-from worker.lang import to_nllb
+from worker import asr
 from worker.render import render_markdown
 
 # A progress callback gets (stage_label, fraction_0_to_1).
@@ -20,7 +19,7 @@ def _noop(stage: str, frac: float) -> None:
 
 
 def _normalize_speaker(label: str | None) -> str:
-    # whisperx emits "SPEAKER_00"; prettify to "Speaker 1".
+    # pyannote emits "SPEAKER_00"; prettify to "Speaker 1".
     if not label:
         return "Unknown speaker"
     if label.upper().startswith("SPEAKER_"):
@@ -29,6 +28,25 @@ def _normalize_speaker(label: str | None) -> str:
         except ValueError:
             return label
     return label
+
+
+def _speaker_for(start, end, spans: list[dict]) -> str:
+    """Pick the diarization speaker whose span overlaps [start, end] most.
+
+    Falls back to the nearest span by midpoint when nothing overlaps (e.g. a
+    Whisper segment landing in a gap between diarized turns).
+    """
+    if start is None or end is None or not spans:
+        return "Unknown speaker"
+    best, best_overlap = None, 0.0
+    for sp in spans:
+        overlap = min(end, sp["end"]) - max(start, sp["start"])
+        if overlap > best_overlap:
+            best_overlap, best = overlap, sp["speaker"]
+    if best is None:
+        mid = (start + end) / 2
+        best = min(spans, key=lambda s: abs((s["start"] + s["end"]) / 2 - mid))["speaker"]
+    return _normalize_speaker(best)
 
 
 def run_pipeline(
@@ -45,50 +63,38 @@ def run_pipeline(
     progress("Loading audio", 0.02)
     audio = asr.load_audio(audio_path)
 
-    progress("Transcribing", 0.10)
-    result = asr.transcribe(audio)
+    # Diarization is acoustic and independent of the text — run it first.
+    progress("Identifying speakers", 0.10)
+    spans = asr.diarize_spans(audio, num_speakers=num_speakers)
+
+    # Whisper translate pass: source speech -> English segments w/ timestamps.
+    progress("Transcribing & translating", 0.45)
+    result = asr.translate_to_english(audio)
     language = result.get("language")
+    segments = result.get("segments", [])
 
-    progress("Aligning words", 0.45)
-    aligned = asr.align(result["segments"], language, audio)
-
-    progress("Identifying speakers", 0.60)
-    diarized = asr.diarize(audio, aligned, num_speakers=num_speakers)
-    segments = diarized.get("segments", [])
-
-    # Collapse word/segment data into clean {speaker, start, end, text} dicts.
+    # Join the two passes: assign each English segment the speaker whose
+    # diarized span overlaps it most in time.
+    progress("Assigning speakers", 0.90)
     clean: list[dict] = []
     speakers: set[str] = set()
     for seg in segments:
-        spk = _normalize_speaker(seg.get("speaker"))
+        start, end = seg.get("start"), seg.get("end")
+        spk = _speaker_for(start, end, spans)
         speakers.add(spk)
         clean.append(
             {
                 "speaker": spk,
-                "start": seg.get("start"),
-                "end": seg.get("end"),
+                "start": start,
+                "end": end,
                 "text": (seg.get("text") or "").strip(),
             }
         )
 
-    # Translate to English unless the source already is English.
-    src_nllb = to_nllb(language)
-    if language == "en" or src_nllb is None:
-        if language != "en":
-            progress("Source language not translatable; keeping original", 0.80)
-    else:
-        progress("Translating to English", 0.80)
-        texts = [c["text"] for c in clean]
-
-        def tcb(frac: float) -> None:
-            progress("Translating to English", 0.80 + 0.15 * frac)
-
-        translated = translate.translate_segments(texts, src_nllb, progress_cb=tcb)
-        for c, t in zip(clean, translated):
-            c["text"] = t
-
     progress("Rendering document", 0.97)
-    num_detected = len(speakers) if speakers else None
+    # Speaker count comes from diarization, not from how many distinct labels
+    # happened to win a segment.
+    num_detected = len({s["speaker"] for s in spans}) if spans else None
     markdown = render_markdown(
         clean,
         original_filename=original_filename,

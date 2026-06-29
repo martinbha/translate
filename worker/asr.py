@@ -1,8 +1,10 @@
-"""WhisperX transcription + alignment + pyannote diarization.
+"""Whisper speech->English translation + independent pyannote diarization.
+
+Two passes over the same audio, joined later by timestamp overlap:
+  * Whisper (task=translate) -> English segments with timestamps
+  * pyannote                 -> speaker spans with timestamps (acoustic, no text)
 
 Heavy models are loaded once and cached for the worker process lifetime.
-WhisperX wraps pyannote for diarization, so this single module covers the
-whole speech->speaker-labeled-segments stage.
 """
 from functools import lru_cache
 
@@ -10,22 +12,17 @@ from app.config import settings
 
 
 @lru_cache(maxsize=1)
-def _whisper_model():
+def _whisper_translate_model():
     import whisperx
 
+    # task="translate": Whisper emits ENGLISH directly for any source language,
+    # which also makes bilingual (e.g. Korean+English) audio come out uniformly
+    # in English instead of being mis-decoded as one forced language.
     return whisperx.load_model(
         settings.whisper_model,
         device=settings.whisper_device,
         compute_type=settings.whisper_compute_type,
-    )
-
-
-@lru_cache(maxsize=8)
-def _align_model(language_code: str):
-    import whisperx
-
-    return whisperx.load_align_model(
-        language_code=language_code, device=settings.whisper_device
+        task="translate",
     )
 
 
@@ -49,6 +46,17 @@ def _diarize_pipeline():
         kwargs["use_auth_token"] = token
     elif "token" in params:
         kwargs["token"] = token
+
+    # Newer whisperx defaults to the gated `speaker-diarization-community-1`.
+    # Pin to a model we have access to (override with DIARIZATION_MODEL).
+    import os
+
+    model_name = os.environ.get(
+        "DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1"
+    )
+    if "model_name" in params:
+        kwargs["model_name"] = model_name
+
     return DiarizationPipeline(**kwargs)
 
 
@@ -58,32 +66,25 @@ def load_audio(path: str):
     return whisperx.load_audio(path)
 
 
-def transcribe(audio) -> dict:
-    """Returns {'segments': [...], 'language': 'xx'}."""
-    model = _whisper_model()
+def translate_to_english(audio) -> dict:
+    """Whisper translate pass. Returns {'segments': [...], 'language': 'xx'}.
+
+    Each segment has 'start', 'end', 'text' (English).
+    """
+    model = _whisper_translate_model()
     return model.transcribe(audio, batch_size=settings.whisper_batch_size)
 
 
-def align(segments, language_code: str, audio) -> dict:
-    import whisperx
-
-    model_a, metadata = _align_model(language_code)
-    return whisperx.align(
-        segments,
-        model_a,
-        metadata,
-        audio,
-        settings.whisper_device,
-        return_char_alignments=False,
-    )
-
-
-def diarize(audio, aligned_result: dict, num_speakers: int | None = None) -> dict:
-    import whisperx
-
+def diarize_spans(audio, num_speakers: int | None = None) -> list[dict]:
+    """Run pyannote on the audio. Returns [{'start', 'end', 'speaker'}, ...]."""
     pipeline = _diarize_pipeline()
     kwargs = {}
     if num_speakers:
         kwargs["num_speakers"] = num_speakers
-    diarize_segments = pipeline(audio, **kwargs)
-    return whisperx.assign_word_speakers(diarize_segments, aligned_result)
+    df = pipeline(audio, **kwargs)  # pandas DataFrame: start, end, speaker
+    spans = [
+        {"start": float(row.start), "end": float(row.end), "speaker": row.speaker}
+        for row in df.itertuples()
+    ]
+    spans.sort(key=lambda s: s["start"])
+    return spans

@@ -48,7 +48,14 @@ def translate_segments(
         ).to(device)
         with torch.no_grad():
             gen = _model.generate(
-                **enc, forced_bos_token_id=bos, max_length=512, num_beams=2
+                **enc,
+                forced_bos_token_id=bos,
+                max_length=512,
+                num_beams=5,
+                # Anti-degeneration: stop NLLB collapsing into "run run run…" loops.
+                no_repeat_ngram_size=3,
+                repetition_penalty=1.3,
+                early_stopping=True,
             )
         out.extend(_tokenizer.batch_decode(gen, skip_special_tokens=True))
         if progress_cb:
