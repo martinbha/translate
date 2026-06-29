@@ -38,10 +38,18 @@ def _diarize_pipeline():
     except ImportError:  # pragma: no cover - version dependent
         from whisperx import DiarizationPipeline  # type: ignore
 
-    return DiarizationPipeline(
-        use_auth_token=settings.hf_token or None,
-        device=settings.whisper_device,
-    )
+    import inspect
+
+    # The HF auth kwarg was renamed use_auth_token -> token across whisperx /
+    # pyannote versions; pick whichever this build actually accepts.
+    params = inspect.signature(DiarizationPipeline.__init__).parameters
+    kwargs = {"device": settings.whisper_device}
+    token = settings.hf_token or None
+    if "use_auth_token" in params:
+        kwargs["use_auth_token"] = token
+    elif "token" in params:
+        kwargs["token"] = token
+    return DiarizationPipeline(**kwargs)
 
 
 def load_audio(path: str):

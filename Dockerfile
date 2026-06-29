@@ -6,7 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv ffmpeg git \
+    python3 python3-pip python3-venv python-is-python3 ffmpeg git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv
