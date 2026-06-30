@@ -28,9 +28,9 @@ def _whisper_translate_model():
 
 @lru_cache(maxsize=1)
 def _diarize_pipeline():
-    # Use whisperx's diarization wrapper — its call signature works reliably on
-    # this box. It returns a pandas DataFrame (start, end, speaker). We compute
-    # voiceprints separately (see _speaker_embeddings).
+    # whisperx's wrapper around pyannote. This whisperx build (paired with
+    # pyannote.audio 4.x) returns (DataFrame, {speaker: embedding}) when called
+    # with return_embeddings=True — so we get voiceprints for free.
     try:
         from whisperx.diarize import DiarizationPipeline
     except ImportError:  # pragma: no cover - version dependent
@@ -47,8 +47,10 @@ def _diarize_pipeline():
     elif "token" in params:
         kwargs["token"] = token
 
+    # Must be the pyannote-4.x-native model. The legacy 3.1 pipeline returns a
+    # generator under pyannote 4.0 and breaks whisperx's `.speaker_diarization`.
     model_name = os.environ.get(
-        "DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1"
+        "DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1"
     )
     if "model_name" in params:
         kwargs["model_name"] = model_name
@@ -71,75 +73,27 @@ def translate_to_english(audio) -> dict:
     return model.transcribe(audio, batch_size=settings.whisper_batch_size)
 
 
-SAMPLE_RATE = 16000
-
-
-@lru_cache(maxsize=1)
-def _embedding_model():
-    # Dedicated speaker-embedding model — decoupled from the diarization
-    # pipeline's internal embeddings (whose API varies across versions).
-    # ECAPA-VoxCeleb is ungated and ships with pyannote's speechbrain dep.
-    import os
-
-    import torch
-    from pyannote.audio.pipelines.speaker_verification import (
-        PretrainedSpeakerEmbedding,
-    )
-
-    name = os.environ.get("EMBEDDING_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
-    return PretrainedSpeakerEmbedding(name, device=torch.device(settings.whisper_device))
-
-
-def _speaker_embeddings(audio, spans: list[dict]) -> dict:
-    """One voiceprint per speaker: embed up to ~30s of each speaker's audio.
-
-    Works off the diarization `spans` (not a pyannote Annotation), so it's
-    independent of pyannote's return type.
-    """
-    import numpy as np
-    import torch
-
-    model = _embedding_model()
-    by_speaker: dict = {}
-    for s in spans:
-        by_speaker.setdefault(s["speaker"], []).append((s["start"], s["end"]))
-
-    out: dict = {}
-    for label, segs in by_speaker.items():
-        chunks, total = [], 0
-        # Longest segments first — they give the cleanest voiceprint.
-        for s, e in sorted(segs, key=lambda x: x[1] - x[0], reverse=True):
-            a, b = int(s * SAMPLE_RATE), int(e * SAMPLE_RATE)
-            chunks.append(audio[a:b])
-            total += b - a
-            if total >= 30 * SAMPLE_RATE:
-                break
-        if not chunks:
-            continue
-        wav = np.concatenate(chunks).astype("float32")
-        if wav.shape[0] < SAMPLE_RATE // 2:  # < 0.5s: too little to embed
-            continue
-        tensor = torch.from_numpy(wav).reshape(1, 1, -1)  # (batch, channel, samples)
-        vec = np.asarray(model(tensor)).reshape(-1)
-        out[label] = vec
-    return out
-
-
 def diarize(audio, num_speakers: int | None = None) -> tuple[list[dict], dict]:
     """Diarize the audio.
 
     Returns:
       spans: [{'start', 'end', 'speaker'}, ...]  (speaker = raw label)
       embeddings: {label: np.ndarray}            (one voiceprint per speaker)
-
-    Embedding is best-effort: if it fails, spans still come back so the
-    transcript completes (speakers just stay anonymous).
     """
+    import numpy as np
+
     pipeline = _diarize_pipeline()
-    kwargs = {}
+    kwargs = {"return_embeddings": True}
     if num_speakers:
         kwargs["num_speakers"] = num_speakers
-    df = pipeline(audio, **kwargs)  # pandas DataFrame: start, end, speaker
+
+    result = pipeline(audio, **kwargs)
+    # return_embeddings=True yields (df, {speaker: [floats]}); be defensive in
+    # case a build returns just the df.
+    if isinstance(result, tuple):
+        df, spk_emb = result
+    else:
+        df, spk_emb = result, None
 
     spans = [
         {"start": float(r.start), "end": float(r.end), "speaker": r.speaker}
@@ -148,11 +102,9 @@ def diarize(audio, num_speakers: int | None = None) -> tuple[list[dict], dict]:
     spans.sort(key=lambda s: s["start"])
 
     embeddings: dict = {}
-    try:
-        embeddings = _speaker_embeddings(audio, spans)
-    except Exception:  # noqa: BLE001 - identification is optional
-        import traceback
-
-        print("Speaker embedding failed; transcript will be anonymous:")
-        traceback.print_exc()
+    if spk_emb:
+        for label, vec in spk_emb.items():
+            arr = np.asarray(vec, dtype="float32")
+            if arr.size and np.all(np.isfinite(arr)):
+                embeddings[label] = arr
     return spans, embeddings
