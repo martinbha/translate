@@ -28,34 +28,32 @@ def _whisper_translate_model():
 
 @lru_cache(maxsize=1)
 def _diarize_pipeline():
-    # Call pyannote directly (not via whisperx's wrapper) so we can request
-    # per-speaker embeddings — the voiceprints used for identification.
+    # Use whisperx's diarization wrapper — its call signature works reliably on
+    # this box. It returns a pandas DataFrame (start, end, speaker). We compute
+    # voiceprints separately (see _speaker_embeddings).
+    try:
+        from whisperx.diarize import DiarizationPipeline
+    except ImportError:  # pragma: no cover - version dependent
+        from whisperx import DiarizationPipeline  # type: ignore
+
     import inspect
     import os
 
-    import torch
-    from pyannote.audio import Pipeline
+    params = inspect.signature(DiarizationPipeline.__init__).parameters
+    kwargs = {"device": settings.whisper_device}
+    token = settings.hf_token or None
+    if "use_auth_token" in params:
+        kwargs["use_auth_token"] = token
+    elif "token" in params:
+        kwargs["token"] = token
 
     model_name = os.environ.get(
         "DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1"
     )
-    # token vs use_auth_token kwarg renamed across versions.
-    params = inspect.signature(Pipeline.from_pretrained).parameters
-    kw = {}
-    token = settings.hf_token or None
-    if "token" in params:
-        kw["token"] = token
-    elif "use_auth_token" in params:
-        kw["use_auth_token"] = token
+    if "model_name" in params:
+        kwargs["model_name"] = model_name
 
-    pipeline = Pipeline.from_pretrained(model_name, **kw)
-    if pipeline is None:
-        raise RuntimeError(
-            f"Failed to load diarization pipeline '{model_name}'. "
-            "Check HF token + model access."
-        )
-    pipeline.to(torch.device(settings.whisper_device))
-    return pipeline
+    return DiarizationPipeline(**kwargs)
 
 
 def load_audio(path: str):
@@ -92,15 +90,19 @@ def _embedding_model():
     return PretrainedSpeakerEmbedding(name, device=torch.device(settings.whisper_device))
 
 
-def _speaker_embeddings(audio, diarization) -> dict:
-    """One voiceprint per speaker: embed up to ~30s of each speaker's audio."""
+def _speaker_embeddings(audio, spans: list[dict]) -> dict:
+    """One voiceprint per speaker: embed up to ~30s of each speaker's audio.
+
+    Works off the diarization `spans` (not a pyannote Annotation), so it's
+    independent of pyannote's return type.
+    """
     import numpy as np
     import torch
 
     model = _embedding_model()
     by_speaker: dict = {}
-    for turn, _, label in diarization.itertracks(yield_label=True):
-        by_speaker.setdefault(label, []).append((turn.start, turn.end))
+    for s in spans:
+        by_speaker.setdefault(s["speaker"], []).append((s["start"], s["end"]))
 
     out: dict = {}
     for label, segs in by_speaker.items():
@@ -133,28 +135,21 @@ def diarize(audio, num_speakers: int | None = None) -> tuple[list[dict], dict]:
     Embedding is best-effort: if it fails, spans still come back so the
     transcript completes (speakers just stay anonymous).
     """
-    import torch
-
     pipeline = _diarize_pipeline()
-    # pyannote wants a file path or an in-memory waveform dict. whisperx gives
-    # us a float32 mono numpy array at 16 kHz.
-    waveform = torch.from_numpy(audio).unsqueeze(0)
-    inp = {"waveform": waveform, "sample_rate": SAMPLE_RATE}
-
     kwargs = {}
     if num_speakers:
         kwargs["num_speakers"] = num_speakers
-    diarization = pipeline(inp, **kwargs)
+    df = pipeline(audio, **kwargs)  # pandas DataFrame: start, end, speaker
 
     spans = [
-        {"start": float(turn.start), "end": float(turn.end), "speaker": speaker}
-        for turn, _, speaker in diarization.itertracks(yield_label=True)
+        {"start": float(r.start), "end": float(r.end), "speaker": r.speaker}
+        for r in df.itertuples()
     ]
     spans.sort(key=lambda s: s["start"])
 
     embeddings: dict = {}
     try:
-        embeddings = _speaker_embeddings(audio, diarization)
+        embeddings = _speaker_embeddings(audio, spans)
     except Exception:  # noqa: BLE001 - identification is optional
         import traceback
 
