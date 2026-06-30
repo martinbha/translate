@@ -28,34 +28,34 @@ def _whisper_translate_model():
 
 @lru_cache(maxsize=1)
 def _diarize_pipeline():
-    # whisperx's wrapper around pyannote. This whisperx build (paired with
-    # pyannote.audio 4.x) returns (DataFrame, {speaker: embedding}) when called
-    # with return_embeddings=True — so we get voiceprints for free.
-    try:
-        from whisperx.diarize import DiarizationPipeline
-    except ImportError:  # pragma: no cover - version dependent
-        from whisperx import DiarizationPipeline  # type: ignore
-
+    # Call pyannote.audio 4.x directly (NOT via whisperx's wrapper, which on
+    # this install passes min/max_speakers=None and trips a generator return
+    # path -> 'generator' has no attribute 'speaker_diarization').
     import inspect
     import os
 
-    params = inspect.signature(DiarizationPipeline.__init__).parameters
-    kwargs = {"device": settings.whisper_device}
-    token = settings.hf_token or None
-    if "use_auth_token" in params:
-        kwargs["use_auth_token"] = token
-    elif "token" in params:
-        kwargs["token"] = token
+    import torch
+    from pyannote.audio import Pipeline
 
-    # Must be the pyannote-4.x-native model. The legacy 3.1 pipeline returns a
-    # generator under pyannote 4.0 and breaks whisperx's `.speaker_diarization`.
     model_name = os.environ.get(
         "DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1"
     )
-    if "model_name" in params:
-        kwargs["model_name"] = model_name
+    params = inspect.signature(Pipeline.from_pretrained).parameters
+    kw = {}
+    token = settings.hf_token or None
+    if "token" in params:
+        kw["token"] = token
+    elif "use_auth_token" in params:
+        kw["use_auth_token"] = token
 
-    return DiarizationPipeline(**kwargs)
+    pipe = Pipeline.from_pretrained(model_name, **kw)
+    if pipe is None:
+        raise RuntimeError(
+            f"Could not load diarization pipeline '{model_name}'. "
+            "Check HF token + that you've accepted the model's terms."
+        )
+    pipe.to(torch.device(settings.whisper_device))
+    return pipe
 
 
 def load_audio(path: str):
@@ -74,37 +74,59 @@ def translate_to_english(audio) -> dict:
 
 
 def diarize(audio, num_speakers: int | None = None) -> tuple[list[dict], dict]:
-    """Diarize the audio.
+    """Diarize the audio via the official pyannote 4.x API.
 
     Returns:
       spans: [{'start', 'end', 'speaker'}, ...]  (speaker = raw label)
       embeddings: {label: np.ndarray}            (one voiceprint per speaker)
     """
-    import numpy as np
+    import types
 
-    pipeline = _diarize_pipeline()
-    kwargs = {"return_embeddings": True}
+    import numpy as np
+    import torch
+
+    pipe = _diarize_pipeline()
+    inp = {"waveform": torch.from_numpy(audio[None, :]), "sample_rate": 16000}
+
+    # Call the documented way: minimal kwargs. Only pass num_speakers if known.
+    kwargs = {}
     if num_speakers:
         kwargs["num_speakers"] = num_speakers
+    output = pipe(inp, **kwargs)
 
-    result = pipeline(audio, **kwargs)
-    # return_embeddings=True yields (df, {speaker: [floats]}); be defensive in
-    # case a build returns just the df.
-    if isinstance(result, tuple):
-        df, spk_emb = result
-    else:
-        df, spk_emb = result, None
+    # Some 4.0.x builds return a generator; the final yielded item is the result.
+    if isinstance(output, types.GeneratorType):
+        last = None
+        for last in output:
+            pass
+        output = last
 
-    spans = [
-        {"start": float(r.start), "end": float(r.end), "speaker": r.speaker}
-        for r in df.itertuples()
-    ]
+    # pyannote 4.x: output.speaker_diarization (an Annotation). Be tolerant of
+    # an older build that returns the Annotation directly.
+    diar = getattr(output, "speaker_diarization", output)
+
+    spans: list[dict] = []
+    if hasattr(diar, "itertracks"):
+        for turn, _, speaker in diar.itertracks(yield_label=True):
+            spans.append(
+                {"start": float(turn.start), "end": float(turn.end), "speaker": speaker}
+            )
+    else:  # 4.0 docs iterate (turn, speaker) pairs directly
+        for turn, speaker in diar:
+            spans.append(
+                {"start": float(turn.start), "end": float(turn.end), "speaker": speaker}
+            )
     spans.sort(key=lambda s: s["start"])
 
+    # Voiceprints, if this build exposes them (best-effort).
     embeddings: dict = {}
-    if spk_emb:
-        for label, vec in spk_emb.items():
-            arr = np.asarray(vec, dtype="float32")
-            if arr.size and np.all(np.isfinite(arr)):
-                embeddings[label] = arr
+    emb = getattr(output, "speaker_embeddings", None)
+    if emb is not None and hasattr(diar, "labels"):
+        for i, label in enumerate(sorted(diar.labels())):
+            try:
+                arr = np.asarray(emb[i], dtype="float32")
+                if arr.size and np.all(np.isfinite(arr)):
+                    embeddings[label] = arr
+            except (IndexError, TypeError, ValueError):
+                pass
     return spans, embeddings

@@ -98,9 +98,19 @@ def run_pipeline(
     audio = asr.load_audio(audio_path)
 
     # Diarization (acoustic) yields speaker spans + a voiceprint per speaker.
+    # It is BEST-EFFORT: if it fails, we still produce the full transcript with
+    # everyone under a single speaker, rather than losing the whole job.
     progress("Identifying speakers", 0.10)
-    spans, speaker_embeddings = asr.diarize(audio, num_speakers=num_speakers)
-    all_labels = sorted({s["speaker"] for s in spans})
+    try:
+        spans, speaker_embeddings = asr.diarize(audio, num_speakers=num_speakers)
+    except Exception:  # noqa: BLE001
+        import traceback
+
+        print("Diarization failed; producing a single-speaker transcript:")
+        traceback.print_exc()
+        spans, speaker_embeddings = [], {}
+    # Fall back to one speaker when diarization gave nothing.
+    all_labels = sorted({s["speaker"] for s in spans}) or ["SPEAKER_00"]
 
     # Whisper translate pass: source speech -> English segments w/ timestamps.
     progress("Transcribing & translating", 0.45)
@@ -114,20 +124,22 @@ def run_pipeline(
     label_to_name = {lbl: info["display_name"] for lbl, info in label_info.items()}
 
     # Assign each English segment to a raw speaker label (kept for re-render).
+    # With no diarization, everything goes to the single fallback speaker.
     progress("Assigning speakers", 0.92)
+    fallback_label = all_labels[0]
     label_segments: list[dict] = []
     for seg in segments:
         start, end = seg.get("start"), seg.get("end")
         label_segments.append(
             {
-                "label": _label_for(start, end, spans),
+                "label": _label_for(start, end, spans) or fallback_label,
                 "start": start,
                 "end": end,
                 "text": (seg.get("text") or "").strip(),
             }
         )
 
-    num_detected = len(all_labels) if all_labels else None
+    num_detected = len(all_labels) if spans else None
 
     progress("Rendering document", 0.97)
     if job_id:
