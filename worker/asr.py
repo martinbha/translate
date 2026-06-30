@@ -73,12 +73,65 @@ def translate_to_english(audio) -> dict:
     return model.transcribe(audio, batch_size=settings.whisper_batch_size)
 
 
+SAMPLE_RATE = 16000
+
+
+@lru_cache(maxsize=1)
+def _embedding_model():
+    # Dedicated speaker-embedding model — decoupled from the diarization
+    # pipeline's internal embeddings (whose API varies across versions).
+    # ECAPA-VoxCeleb is ungated and ships with pyannote's speechbrain dep.
+    import os
+
+    import torch
+    from pyannote.audio.pipelines.speaker_verification import (
+        PretrainedSpeakerEmbedding,
+    )
+
+    name = os.environ.get("EMBEDDING_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
+    return PretrainedSpeakerEmbedding(name, device=torch.device(settings.whisper_device))
+
+
+def _speaker_embeddings(audio, diarization) -> dict:
+    """One voiceprint per speaker: embed up to ~30s of each speaker's audio."""
+    import numpy as np
+    import torch
+
+    model = _embedding_model()
+    by_speaker: dict = {}
+    for turn, _, label in diarization.itertracks(yield_label=True):
+        by_speaker.setdefault(label, []).append((turn.start, turn.end))
+
+    out: dict = {}
+    for label, segs in by_speaker.items():
+        chunks, total = [], 0
+        # Longest segments first — they give the cleanest voiceprint.
+        for s, e in sorted(segs, key=lambda x: x[1] - x[0], reverse=True):
+            a, b = int(s * SAMPLE_RATE), int(e * SAMPLE_RATE)
+            chunks.append(audio[a:b])
+            total += b - a
+            if total >= 30 * SAMPLE_RATE:
+                break
+        if not chunks:
+            continue
+        wav = np.concatenate(chunks).astype("float32")
+        if wav.shape[0] < SAMPLE_RATE // 2:  # < 0.5s: too little to embed
+            continue
+        tensor = torch.from_numpy(wav).reshape(1, 1, -1)  # (batch, channel, samples)
+        vec = np.asarray(model(tensor)).reshape(-1)
+        out[label] = vec
+    return out
+
+
 def diarize(audio, num_speakers: int | None = None) -> tuple[list[dict], dict]:
     """Diarize the audio.
 
     Returns:
       spans: [{'start', 'end', 'speaker'}, ...]  (speaker = raw label)
-      embeddings: {label: np.ndarray}            (centroid voiceprint per speaker)
+      embeddings: {label: np.ndarray}            (one voiceprint per speaker)
+
+    Embedding is best-effort: if it fails, spans still come back so the
+    transcript completes (speakers just stay anonymous).
     """
     import torch
 
@@ -86,12 +139,12 @@ def diarize(audio, num_speakers: int | None = None) -> tuple[list[dict], dict]:
     # pyannote wants a file path or an in-memory waveform dict. whisperx gives
     # us a float32 mono numpy array at 16 kHz.
     waveform = torch.from_numpy(audio).unsqueeze(0)
-    inp = {"waveform": waveform, "sample_rate": 16000}
+    inp = {"waveform": waveform, "sample_rate": SAMPLE_RATE}
 
-    kwargs = {"return_embeddings": True}
+    kwargs = {}
     if num_speakers:
         kwargs["num_speakers"] = num_speakers
-    diarization, emb_matrix = pipeline(inp, **kwargs)
+    diarization = pipeline(inp, **kwargs)
 
     spans = [
         {"start": float(turn.start), "end": float(turn.end), "speaker": speaker}
@@ -99,10 +152,12 @@ def diarize(audio, num_speakers: int | None = None) -> tuple[list[dict], dict]:
     ]
     spans.sort(key=lambda s: s["start"])
 
-    # emb_matrix rows align with sorted(diarization.labels()).
     embeddings: dict = {}
-    if emb_matrix is not None:
-        for i, label in enumerate(sorted(diarization.labels())):
-            if i < len(emb_matrix):
-                embeddings[label] = emb_matrix[i]
+    try:
+        embeddings = _speaker_embeddings(audio, diarization)
+    except Exception:  # noqa: BLE001 - identification is optional
+        import traceback
+
+        print("Speaker embedding failed; transcript will be anonymous:")
+        traceback.print_exc()
     return spans, embeddings
